@@ -1,0 +1,33 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+import os
+import re
+
+class FileUtil():
+
+    def get_file_content(self, src_path, filename):
+
+        with open(os.path.join(src_path, filename), 'r', encoding='utf-8') as f:
+            content = f.read()
+            #print(content)
+        return content
+
+    def get_files(self,src_path, filename):
+        file_path = os.path.join(src_path, filename)
+        list1 =[]
+        for root, dirs, files in os.walk(src_path, topdown=True):
+            for file in files:
+                flag = re.search(filename, file, re.I)
+                if flag :
+                    list1.append(os.path.join(src_path, file))
+        return  list1
+
+    # 列表去重方法
+    def list_filter(self, deal_list):
+        return list(set(deal_list))
+
+
+
+
+if __name__ == '__main__':
+    FileUtil().get_files('C:\\Users\\Administrator\\Desktop\\CODE\\git\\go-build-template', 'makefile')
