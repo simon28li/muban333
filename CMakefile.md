@@ -36,6 +36,3 @@ class Makefile_service():
 if __name__ == '__main__':
     Makefile_service().get_makefile_dep()
 
-
-
-
