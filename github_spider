@@ -1,0 +1,182 @@
+from bs4 import BeautifulSoup
+import requests
+import re
+from github import Github
+import pandas as pd
+import json
+import sqlalchemy
+import sqlite3
+from retrying import retry
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+
+con = sqlite3.connect('spark.db', check_same_thread=False)
+github_header={
+'User-Agent':'Mozilla/5.0',
+'Authorization':'token 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',
+'Content-Type':'application/json',
+'method':'GET',
+'Accept':'application/json'
+}
+
+# 获取github requests commits 数据
+class GithubRequestsCommits:
+    def update_one_repo_github(self, repo):
+        """
+        根据软件名称，获取requests，并插入数据库
+        :return:
+        """
+        pool_size = 5 # github二级速率限制，最大线程数6
+        # 按线程数获取requests分页
+        page_list = self.get_pages(repo, pool_size)
+        all_data = pd.DataFrame()
+        # 多线程获取分页列表结果
+        with ThreadPoolExecutor(max_workers=pool_size) as pool:
+            future = []
+            for page in page_list:
+                future.append(pool.submit(self.get_pages_data, page))
+            for res in as_completed(future):
+                github_data = res.result()
+                all_data = pd.concat([all_data, github_data], axis=0, ignore_index=True)
+        if repo['get_github_type'] == "requests":
+            table_name = "requests"
+            # todo 时间NaT问题
+            all_data.drop_duplicates(subset='number')
+            all_data = all_data.astype({'closed_at': 'str', 'merged_at': 'str'})
+        else:
+            table_name = "commits"
+        all_data.to_sql(table_name, con, if_exists='replace', index=False)
+
+    def get_pages(self, repo, pool_size):
+        """
+        获取页数
+        :return:
+        """
+        page_list = []
+        # todo 获取总页数
+        if repo["get_github_type"] == "requests":
+            page = 388
+        else:
+            page = 5
+        per_page = (page // pool_size) if (page % pool_size == 0) else (page // pool_size)+1
+        for i in range(pool_size):
+            repo["start"] = i * per_page
+            repo["end"] = (i+1) * per_page if page > (i+1) * per_page else page
+            page_list.append(repo.copy())
+        return page_list
+
+    def get_pages_data(self, repo):
+        """
+        按分页列表获取requests数据
+        :param repo:
+        :return:
+        """
+        github_data_all = pd.DataFrame()
+        for page in range(repo["start"], repo["end"]):
+            repo["page"] = page + 1
+            data_per_page = self.get_per_page_data(repo)
+            if not data_per_page.empty:
+                github_data_all = pd.concat([github_data_all, data_per_page], axis=0, ignore_index=True)
+        return github_data_all
+
+    def get_per_page_data(self, repo):
+        """
+        通过github api 按页获取requests数据
+        :param page:
+        :return:
+        """
+        try:
+            print(f"repo:{repo['repo_name']} get {repo['get_github_type']}, page  {repo['page']}")
+            data_per_page = pd.DataFrame()
+            if repo['get_github_type'] == "requests":
+                url_suffix = "/pulls?state=all&"
+            else:
+                url_suffix = "/commits?"
+            url = "https://api.github.com/repos/" + repo["git_name"] + url_suffix \
+                  + "per_page=100&page=" + str(repo["page"])
+            github_html = requests.get(url, headers=github_header).text
+            if github_html:
+                df = pd.read_json(github_html)
+                if not df.empty:
+                    if repo['get_github_type'] == "requests":
+                        data_per_page = df.apply(lambda x: self.parse_requests(x), axis=1)
+                    else:
+                        data_per_page = df.apply(lambda x: self.parse_commits(x), axis=1)
+        except Exception as e:
+            #todo 异常数据存list，重新再跑
+            print(e)
+        finally:
+            return data_per_page
+    def parse_requests(self, requests_info):
+        """
+        转换requests内容
+        :return:
+        """
+        user = requests_info["user"]
+        requests_info["author"] = user.get('login', '')
+        requests_info["login_id"] = user.get('id', '')
+        head = requests_info["head"]
+        requests_info = requests_info[['number', 'author', 'login_id', 'state', 'created_at', 'updated_at', \
+            'closed_at', 'merged_at', 'title', 'html_url']]
+        return requests_info
+
+    def parse_commits(self, commits_info):
+        """
+        转换commits内容
+        :return:
+        """
+        commit = commits_info["commit"]
+        author = commits_info["author"]
+        commits_info["commit_author"] = commit.get('author').get('name', '')
+        commits_info["commit_email"] = commit.get('author').get('email', '')
+        commits_info["commit_time"] = commit.get('author').get('date', '')
+        commits_info["message"] = commit.get('message', '')
+        commits_info["author"] = author.get('login', '') if author else ""
+        commits_info["login_id"] = author.get('id', '') if author else ""
+        commits_info = commits_info[['sha', 'commit_author','commit_email', 'commit_time',
+                                     'author', 'login_id', 'message']]
+        return commits_info
+
+    def get_commit_by_pull(self, pull_id, repo=""):
+        #url = "https://github.com/" + repo["git_name"] + "/pulls/" + pull_id + "/commits"
+        # todo 网页爬取 不消耗token
+        sha = ""
+        try:
+            url = "https://api.github.com/repos/apache/hbase/pulls/" + str(pull_id) + "/commits"
+            github_html = requests.get(url, headers=github_header).text
+            df = pd.read_json(github_html)
+            if not df.empty:
+                sha = df['sha'][0]
+        except :
+            print("error")
+        finally:
+            return sha
+
+    def get_requests_group(self, repo):
+        sql = "select * from requests"
+        requests_data = pd.read_sql(sql, con)
+        requests_user = requests_data.groupby(['login_id']).agg(number=('number','max'),
+                                                                 login_id=('login_id', 'max'),
+                                                                 author=('author', 'max'))
+        requests_user['sha'] = requests_user.apply(lambda x: self.get_commit_by_pull(x['number']), axis=1)
+        requests_user.to_sql("request_user", con, if_exists='replace', index=False)
+
+        # todo 多线程爬取request_user的commit_id
+
+    def get_page_num(self):
+        """
+        获取commits和requests页数
+        :return:
+        """
+        g = Github(login_or_token="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")
+        gp = g.get_repo("apache/spark")
+        commits = gp.get_commits()#196 34821 349
+        pulls = gp.get_pulls(state="all")#49 38784 388
+        print(commits, pulls)
+
+if __name__ == '__main__':
+    # todo 获取page ，动态token拼接headers
+    repo_commits = {"repo_name": "spark", "git_name": "apache/spark", "get_github_type" : "commits"}
+    repo_requests = {"repo_name": "spark", "git_name": "apache/spark", "get_github_type": "requests"}
+    GithubRequestsCommits().update_one_repo_github(repo_requests)
